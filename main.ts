@@ -2,20 +2,39 @@
 // 支持：火山引擎 (VolcEngine)、Gitee (模力方舟)、ModelScope (魔塔)
 // 路由策略：根据 API Key 格式自动分发
 
+// ================= 导入日志模块 =================
+
+import {
+  configureLogger,
+  initLogger,
+  closeLogger,
+  logRequestStart,
+  logRequestEnd,
+  logProviderRouting,
+  logApiCallStart,
+  logApiCallEnd,
+  generateRequestId,
+  info,
+  warn,
+  error,
+  debug,
+  LogLevel,
+  // 增强日志函数
+  logFullPrompt,
+  logInputImages,
+  logImageGenerationStart,
+  logGeneratedImages,
+  logImageGenerationComplete,
+  logImageGenerationFailed,
+} from "./logger.ts";
+
 // ================= 配置常量 =================
 
-// 1. 火山引擎配置
 const VOLC_API_URL = "https://ark.cn-beijing.volces.com/api/v3/images/generations";
-
-// 2. Gitee 配置
 const GITEE_API_URL = "https://ai.gitee.com/v1/images/generations";
 const GITEE_DEFAULT_MODEL = "z-image-turbo";
-
-// 3. ModelScope 配置
 const MODELSCOPE_API_URL = "https://api-inference.modelscope.cn/v1";
 const MODELSCOPE_DEFAULT_MODEL = "Tongyi-MAI/Z-Image-Turbo";
-
-// 端口配置
 const PORT = parseInt(Deno.env.get("PORT") || "10001");
 
 // ================= 类型定义 =================
@@ -32,39 +51,30 @@ interface ChatRequest {
 
 // ================= 核心逻辑 =================
 
-/**
- * 根据 API Key 格式识别渠道
- */
 function detectProvider(apiKey: string): Provider {
   if (!apiKey) return "Unknown";
 
-  // ModelScope: 以 ms- 开头
   if (apiKey.startsWith("ms-")) {
+    logProviderRouting("ModelScope", apiKey.substring(0, 4));
     return "ModelScope";
   }
 
-  // 火山引擎: UUID 格式 (36位，包含 -)
-  // 例如: YOUR-UUID-HERE
   const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
   if (uuidRegex.test(apiKey)) {
+    logProviderRouting("VolcEngine", apiKey.substring(0, 4));
     return "VolcEngine";
   }
 
-  // Gitee: 40位纯字母数字
-  // 例如: YOUR-GITEE-KEY-HERE
-  // Gitee: 通常是 40 位纯字母数字，但也可能稍有不同，放宽到 30-60 位
-  // 例如: YOUR-GITEE-KEY-HERE
   const giteeRegex = /^[a-zA-Z0-9]{30,60}$/;
   if (giteeRegex.test(apiKey)) {
+    logProviderRouting("Gitee", apiKey.substring(0, 4));
     return "Gitee";
   }
 
+  logProviderRouting("Unknown", apiKey.substring(0, 4));
   return "Unknown";
 }
 
-/**
- * 提取 Prompt 和 Images
- */
 function extractPromptAndImages(messages: any[]): { prompt: string; images: string[] } {
   let prompt = "";
   let images: string[] = [];
@@ -91,18 +101,34 @@ function extractPromptAndImages(messages: any[]): { prompt: string; images: stri
 
 // ================= 渠道处理函数 =================
 
-/**
- * 处理火山引擎请求
- */
-async function handleVolcEngine(apiKey: string, reqBody: ChatRequest, prompt: string, images: string[]): Promise<string> {
-  console.log("👉 路由至: 火山引擎 (VolcEngine)");
+async function handleVolcEngine(
+  apiKey: string,
+  reqBody: ChatRequest,
+  prompt: string,
+  images: string[],
+  requestId: string
+): Promise<string> {
+  const startTime = Date.now();
+  logApiCallStart("VolcEngine", "generate_image");
+  
+  // 记录完整 Prompt
+  logFullPrompt("VolcEngine", requestId, prompt);
+  
+  // 记录输入图片
+  logInputImages("VolcEngine", requestId, images);
+  
+  const model = reqBody.model || "doubao-seedream-4-0-250828";
+  const size = reqBody.size || "4096x4096";
+  
+  // 记录生成开始
+  logImageGenerationStart("VolcEngine", requestId, model, size, prompt.length);
   
   const arkRequest = {
-    model: reqBody.model || "doubao-seedream-4-0-250828",
+    model: model,
     prompt: prompt || "A beautiful scenery",
-    image: images, // 火山引擎支持图生图
+    image: images,
     response_format: "url",
-    size: reqBody.size || "4096x4096",
+    size: size,
     seed: -1,
     stream: false,
     watermark: false,
@@ -120,30 +146,54 @@ async function handleVolcEngine(apiKey: string, reqBody: ChatRequest, prompt: st
 
   if (!response.ok) {
     const errorText = await response.text();
-    throw new Error(`VolcEngine API Error (${response.status}): ${errorText}`);
+    const err = new Error(`VolcEngine API Error (${response.status}): ${errorText}`);
+    logImageGenerationFailed("VolcEngine", requestId, errorText);
+    logApiCallEnd("VolcEngine", "generate_image", false, Date.now() - startTime);
+    throw err;
   }
 
   const data = await response.json();
-  return data.data?.map((img: { url: string }) => `![Generated Image](${img.url})`).join("\n\n") || "图片生成失败";
+  
+  // 记录生成的图片 URL
+  logGeneratedImages("VolcEngine", requestId, data.data || []);
+  
+  const duration = Date.now() - startTime;
+  const imageCount = data.data?.length || 0;
+  logImageGenerationComplete("VolcEngine", requestId, imageCount, duration);
+  
+  const result = data.data?.map((img: { url: string }) => `![Generated Image](${img.url})`).join("\n\n") || "图片生成失败";
+  
+  logApiCallEnd("VolcEngine", "generate_image", true, duration);
+  return result;
 }
 
-/**
- * 处理 Gitee 请求
- */
-async function handleGitee(apiKey: string, reqBody: ChatRequest, prompt: string): Promise<string> {
-  console.log("👉 路由至: Gitee (模力方舟)");
-  console.log(`   API Key 长度: ${apiKey.length}, 前4位: ${apiKey.substring(0, 4)}...`);
+async function handleGitee(
+  apiKey: string,
+  reqBody: ChatRequest,
+  prompt: string,
+  requestId: string
+): Promise<string> {
+  const startTime = Date.now();
+  logApiCallStart("Gitee", "generate_image");
+
+  // 记录完整 Prompt
+  logFullPrompt("Gitee", requestId, prompt);
+  
+  const model = reqBody.model?.includes("z-image") ? reqBody.model : GITEE_DEFAULT_MODEL;
+  const size = reqBody.size || "2048x2048";
+  
+  // 记录生成开始
+  logImageGenerationStart("Gitee", requestId, model, size, prompt.length);
 
   const giteeRequest = {
-    model: reqBody.model?.includes("z-image") ? reqBody.model : GITEE_DEFAULT_MODEL,
+    model: model,
     prompt: prompt || "A beautiful scenery",
-    size: reqBody.size || "1024x1024", // Gitee 默认 1024x1024
+    size: size,
     n: 1,
     response_format: "url"
   };
 
-  console.log(`   发送请求到: ${GITEE_API_URL}`);
-  console.log(`   请求体: ${JSON.stringify(giteeRequest)}`);
+  debug("Gitee", `发送请求到: ${GITEE_API_URL}`);
 
   const response = await fetch(GITEE_API_URL, {
     method: "POST",
@@ -155,25 +205,32 @@ async function handleGitee(apiKey: string, reqBody: ChatRequest, prompt: string)
     body: JSON.stringify(giteeRequest),
   });
 
-  console.log(`   响应状态: ${response.status} ${response.statusText}`);
-
   if (!response.ok) {
     const errorText = await response.text();
-    console.error(`   Gitee API 错误: ${response.status} - ${errorText}`);
-    throw new Error(`Gitee API Error (${response.status}): ${errorText}`);
+    const err = new Error(`Gitee API Error (${response.status}): ${errorText}`);
+    error("Gitee", `API 错误: ${response.status}`);
+    logImageGenerationFailed("Gitee", requestId, errorText);
+    logApiCallEnd("Gitee", "generate_image", false, Date.now() - startTime);
+    throw err;
   }
 
   const responseText = await response.text();
-  console.log(`   原始响应: ${responseText}`);
-
   const data = JSON.parse(responseText);
-  console.log(`   解析后的 data: ${JSON.stringify(data.data)}`);
 
-  // Gitee 返回格式: { data: [{ url: "..." }], created: 123456789 }
   if (!data.data || !Array.isArray(data.data) || data.data.length === 0) {
-    console.error(`   Gitee 返回数据格式异常: ${JSON.stringify(data)}`);
-    throw new Error(`Gitee API 返回数据格式异常: ${JSON.stringify(data)}`);
+    const err = new Error(`Gitee API 返回数据格式异常: ${JSON.stringify(data)}`);
+    error("Gitee", "返回数据格式异常");
+    logImageGenerationFailed("Gitee", requestId, "返回数据格式异常");
+    logApiCallEnd("Gitee", "generate_image", false, Date.now() - startTime);
+    throw err;
   }
+
+  // 记录生成的图片 URL
+  logGeneratedImages("Gitee", requestId, data.data);
+  
+  const duration = Date.now() - startTime;
+  const imageCount = data.data.length;
+  logImageGenerationComplete("Gitee", requestId, imageCount, duration);
 
   const imageUrls = data.data.map((img: { url?: string; b64_json?: string }) => {
     if (img.url) {
@@ -185,48 +242,61 @@ async function handleGitee(apiKey: string, reqBody: ChatRequest, prompt: string)
   }).filter(Boolean);
 
   const result = imageUrls.join("\n\n");
-  console.log(`   生成的图片内容: ${result}`);
-
+  logApiCallEnd("Gitee", "generate_image", true, duration);
   return result || "图片生成失败";
 }
 
-/**
- * 处理 ModelScope 请求 (异步轮询)
- */
-async function handleModelScope(apiKey: string, reqBody: ChatRequest, prompt: string): Promise<string> {
-  console.log("👉 路由至: ModelScope (魔塔)");
+async function handleModelScope(
+  apiKey: string,
+  reqBody: ChatRequest,
+  prompt: string,
+  requestId: string
+): Promise<string> {
+  const startTime = Date.now();
+  logApiCallStart("ModelScope", "generate_image");
 
-  const model = reqBody.model?.includes("Z-Image") ? reqBody.model : MODELSCOPE_DEFAULT_MODEL;
+  // 记录完整 Prompt
+  logFullPrompt("ModelScope", requestId, prompt);
   
-  // 1. 提交任务
+  const model = reqBody.model?.includes("Z-Image") ? reqBody.model : MODELSCOPE_DEFAULT_MODEL;
+  const size = reqBody.size || "2048x2048";
+  
+  // 记录生成开始
+  logImageGenerationStart("ModelScope", requestId, model, size, prompt.length);
+
   const submitResponse = await fetch(`${MODELSCOPE_API_URL}/images/generations`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       "Authorization": `Bearer ${apiKey}`,
-      "X-ModelScope-Async-Mode": "true" // 强制异步
+      "X-ModelScope-Async-Mode": "true"
     },
     body: JSON.stringify({
       model: model,
       prompt: prompt || "A beautiful scenery",
-      size: reqBody.size || "2048x2048",
+      size: size,
       n: 1
     }),
   });
 
   if (!submitResponse.ok) {
     const errorText = await submitResponse.text();
-    throw new Error(`ModelScope Submit Error (${submitResponse.status}): ${errorText}`);
+    const err = new Error(`ModelScope Submit Error (${submitResponse.status}): ${errorText}`);
+    logImageGenerationFailed("ModelScope", requestId, errorText);
+    logApiCallEnd("ModelScope", "generate_image", false, Date.now() - startTime);
+    throw err;
   }
 
   const submitData = await submitResponse.json();
   const taskId = submitData.task_id;
-  console.log(`   ModelScope Task ID: ${taskId}, 开始轮询...`);
+  info("ModelScope", `任务已提交, Task ID: ${taskId}`);
 
-  // 2. 轮询结果
-  const maxAttempts = 60; // 5分钟超时
+  const maxAttempts = 60;
+  let pollingAttempts = 0;
+  
   for (let i = 0; i < maxAttempts; i++) {
-    await new Promise(resolve => setTimeout(resolve, 5000)); // 等待 5 秒
+    await new Promise(resolve => setTimeout(resolve, 5000));
+    pollingAttempts++;
 
     const checkResponse = await fetch(`${MODELSCOPE_API_URL}/tasks/${taskId}`, {
       method: "GET",
@@ -237,7 +307,7 @@ async function handleModelScope(apiKey: string, reqBody: ChatRequest, prompt: st
     });
 
     if (!checkResponse.ok) {
-      console.warn(`   ModelScope Polling Warning: ${checkResponse.status}`);
+      warn("ModelScope", `轮询警告: ${checkResponse.status}`);
       continue;
     }
 
@@ -245,37 +315,62 @@ async function handleModelScope(apiKey: string, reqBody: ChatRequest, prompt: st
     const status = checkData.task_status;
 
     if (status === "SUCCEED") {
-      console.log("   ModelScope Task SUCCEED!");
       const imageUrls = checkData.output_images || [];
-      return imageUrls.map((url: string) => `![Generated Image](${url})`).join("\n\n") || "图片生成失败";
+      
+      // 记录生成的图片 URL
+      const imageData = imageUrls.map((url: string) => ({ url }));
+      logGeneratedImages("ModelScope", requestId, imageData);
+      
+      const duration = Date.now() - startTime;
+      const imageCount = imageUrls.length;
+      logImageGenerationComplete("ModelScope", requestId, imageCount, duration);
+      
+      const result = imageUrls.map((url: string) => `![Generated Image](${url})`).join("\n\n") || "图片生成失败";
+      
+      info("ModelScope", `任务成功完成, 耗时: ${pollingAttempts}次轮询`);
+      logApiCallEnd("ModelScope", "generate_image", true, duration);
+      return result;
     } else if (status === "FAILED") {
-      throw new Error(`ModelScope Task Failed: ${JSON.stringify(checkData)}`);
+      const err = new Error(`ModelScope Task Failed: ${JSON.stringify(checkData)}`);
+      error("ModelScope", "任务失败");
+      logImageGenerationFailed("ModelScope", requestId, JSON.stringify(checkData));
+      logApiCallEnd("ModelScope", "generate_image", false, Date.now() - startTime);
+      throw err;
     } else {
-      console.log(`   ModelScope Status: ${status} (Attempt ${i + 1}/${maxAttempts})`);
+      debug("ModelScope", `状态: ${status} (第${i + 1}次)`);
     }
   }
 
-  throw new Error("ModelScope Task Timeout");
+  const err = new Error("ModelScope Task Timeout");
+  error("ModelScope", "任务超时");
+  logImageGenerationFailed("ModelScope", requestId, "任务超时");
+  logApiCallEnd("ModelScope", "generate_image", false, Date.now() - startTime);
+  throw err;
 }
 
 // ================= 主处理函数 =================
 
 async function handleChatCompletions(req: Request): Promise<Response> {
   const url = new URL(req.url);
+  const requestId = generateRequestId();
 
-  // 1. 路由校验
+  const reqInfo = logRequestStart(req, requestId);
+
   if (url.pathname !== "/v1/chat/completions") {
+    warn("HTTP", `路由不匹配: ${url.pathname}`);
+    await logRequestEnd(requestId, req.method, url.pathname, 404, 0);
     return new Response(JSON.stringify({ error: "Not found" }), { 
       status: 404, 
       headers: { "Content-Type": "application/json" } 
     });
   }
 
-  // 2. 认证校验与渠道识别
   const authHeader = req.headers.get("Authorization");
   const apiKey = authHeader?.replace("Bearer ", "").trim();
   
   if (!apiKey) {
+    warn("HTTP", "Authorization header 缺失");
+    await logRequestEnd(requestId, req.method, url.pathname, 401, 0, "missing auth");
     return new Response(JSON.stringify({ error: "Authorization header missing" }), { 
       status: 401, 
       headers: { "Content-Type": "application/json" } 
@@ -284,37 +379,42 @@ async function handleChatCompletions(req: Request): Promise<Response> {
 
   const provider = detectProvider(apiKey);
   if (provider === "Unknown") {
+    warn("HTTP", "API Key 格式无法识别");
+    await logRequestEnd(requestId, req.method, url.pathname, 401, 0, "invalid key");
     return new Response(JSON.stringify({ error: "Invalid API Key format. Could not detect provider." }), { 
       status: 401, 
       headers: { "Content-Type": "application/json" } 
     });
   }
 
+  info("HTTP", `路由到 ${provider}`);
+
   try {
     const requestBody: ChatRequest = await req.json();
     const isStream = requestBody.stream === true;
     const { prompt, images } = extractPromptAndImages(requestBody.messages || []);
 
-    // 3. 分发请求
+    // 记录完整 Prompt（DEBUG 级别只记录摘要）
+    debug("Router", `提取 Prompt: ${prompt?.substring(0, 80)}... (完整长度: ${prompt?.length || 0})`);
+
     let imageContent = "";
     
     switch (provider) {
       case "VolcEngine":
-        imageContent = await handleVolcEngine(apiKey, requestBody, prompt, images);
+        imageContent = await handleVolcEngine(apiKey, requestBody, prompt, images, requestId);
         break;
       case "Gitee":
-        imageContent = await handleGitee(apiKey, requestBody, prompt);
+        imageContent = await handleGitee(apiKey, requestBody, prompt, requestId);
         break;
       case "ModelScope":
-        imageContent = await handleModelScope(apiKey, requestBody, prompt);
+        imageContent = await handleModelScope(apiKey, requestBody, prompt, requestId);
         break;
     }
 
-    // 4. 构造响应
     const responseId = `chatcmpl-${crypto.randomUUID()}`;
     const modelName = requestBody.model || "unknown-model";
+    const startTime = Date.now();
 
-    // 处理流式返回 (SSE)
     if (isStream) {
       const encoder = new TextEncoder();
       const stream = new ReadableStream({
@@ -349,6 +449,9 @@ async function handleChatCompletions(req: Request): Promise<Response> {
         }
       });
 
+      info("HTTP", `响应完成 (流式)`);
+      await logRequestEnd(requestId, req.method, url.pathname, 200, Date.now() - startTime);
+      
       return new Response(stream, {
         headers: {
           "Content-Type": "text/event-stream",
@@ -359,8 +462,7 @@ async function handleChatCompletions(req: Request): Promise<Response> {
       });
     }
 
-    // 处理普通 JSON 返回
-    return new Response(JSON.stringify({
+    const responseBody = JSON.stringify({
       id: responseId,
       object: "chat.completion",
       created: Math.floor(Date.now() / 1000),
@@ -371,18 +473,27 @@ async function handleChatCompletions(req: Request): Promise<Response> {
         finish_reason: "stop"
       }],
       usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
-    }), {
+    });
+
+    info("HTTP", `响应完成 (JSON)`);
+    await logRequestEnd(requestId, req.method, url.pathname, 200, Date.now() - startTime);
+
+    return new Response(responseBody, {
       headers: { 
         "Content-Type": "application/json", 
         "Access-Control-Allow-Origin": "*" 
       }
     });
 
-  } catch (error: unknown) {
-    const errorMessage = error instanceof Error ? error.message : "Internal Server Error";
-    console.error(`Proxy Error (${provider}):`, error);
+  } catch (err) {
+    const errorMessage = err instanceof Error ? err.message : "Internal Server Error";
+    const errorProvider = provider || "Unknown";
+    
+    error("Proxy", `请求处理错误 (${errorProvider}): ${errorMessage}`);
+    await logRequestEnd(requestId, req.method, url.pathname, 500, 0, errorMessage);
+    
     return new Response(JSON.stringify({ 
-      error: { message: errorMessage, type: "server_error", provider: provider } 
+      error: { message: errorMessage, type: "server_error", provider: errorProvider } 
     }), { 
       status: 500, 
       headers: { "Content-Type": "application/json" } 
@@ -392,9 +503,28 @@ async function handleChatCompletions(req: Request): Promise<Response> {
 
 // ================= 启动服务 =================
 
-console.log(`🚀 三合一图像生成 API 中转服务 (v2.0) 启动在端口 ${PORT}`);
-console.log(`   支持渠道: 火山引擎, Gitee, ModelScope`);
-console.log(`   注意: 请确保已重启服务以加载最新代码！`);
+await initLogger();
+
+const logLevel = Deno.env.get("LOG_LEVEL")?.toUpperCase();
+if (logLevel && logLevel in LogLevel) {
+  configureLogger({ level: LogLevel[logLevel as keyof typeof LogLevel] });
+}
+
+info("Startup", `🚀 服务启动端口 ${PORT}`);
+info("Startup", "🔧 支持: 火山引擎, Gitee, ModelScope");
+info("Startup", `📁 日志目录: ./data/logs`);
+
+Deno.addSignalListener("SIGINT", async () => {
+  info("Startup", "收到 SIGINT, 关闭服务...");
+  await closeLogger();
+  Deno.exit(0);
+});
+
+Deno.addSignalListener("SIGTERM", async () => {
+  info("Startup", "收到 SIGTERM, 关闭服务...");
+  await closeLogger();
+  Deno.exit(0);
+});
 
 Deno.serve({ port: PORT }, async (req: Request) => {
   if (req.method === "OPTIONS") {
@@ -409,6 +539,7 @@ Deno.serve({ port: PORT }, async (req: Request) => {
   }
 
   if (req.method !== "POST") {
+    warn("HTTP", `不支持 ${req.method}`);
     return new Response("Method Not Allowed", { status: 405 });
   }
 

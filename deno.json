@@ -15,7 +15,7 @@
     }
   },
   "tasks": {
-    "dev": "deno run --allow-net --allow-env --watch main.ts",
-    "start": "deno run --allow-net --allow-env main.ts"
+    "dev": "deno run --allow-net --allow-env --allow-write --watch main.ts",
+    "start": "deno run --allow-net --allow-env --allow-write main.ts"
   }
 }
