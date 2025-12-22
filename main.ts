@@ -36,17 +36,38 @@ const GITEE_DEFAULT_MODEL = "z-image-turbo";
 const MODELSCOPE_API_URL = "https://api-inference.modelscope.cn/v1";
 const MODELSCOPE_DEFAULT_MODEL = "Tongyi-MAI/Z-Image-Turbo";
 const PORT = parseInt(Deno.env.get("PORT") || "10001");
+// 统一超时时间：120秒（适用于所有渠道的 API 请求）
+const API_TIMEOUT_MS = 120000;
 
 // ================= 类型定义 =================
 
 type Provider = "VolcEngine" | "Gitee" | "ModelScope" | "Unknown";
 
+// 消息内容项类型
+interface TextContentItem {
+  type: "text";
+  text: string;
+}
+
+interface ImageUrlContentItem {
+  type: "image_url";
+  image_url?: { url: string };
+}
+
+type MessageContentItem = TextContentItem | ImageUrlContentItem;
+
+// 消息类型
+interface Message {
+  role: string;
+  content: string | MessageContentItem[];
+}
+
 interface ChatRequest {
   model?: string;
-  messages: { role: string; content: string | any[] }[];
+  messages: Message[];
   stream?: boolean;
   size?: string;
-  [key: string]: any;
+  [key: string]: unknown;
 }
 
 // ================= 核心逻辑 =================
@@ -75,7 +96,7 @@ function detectProvider(apiKey: string): Provider {
   return "Unknown";
 }
 
-function extractPromptAndImages(messages: any[]): { prompt: string; images: string[] } {
+function extractPromptAndImages(messages: Message[]): { prompt: string; images: string[] } {
   let prompt = "";
   let images: string[] = [];
 
@@ -85,18 +106,46 @@ function extractPromptAndImages(messages: any[]): { prompt: string; images: stri
       if (typeof userContent === "string") {
         prompt = userContent;
       } else if (Array.isArray(userContent)) {
-        const textItem = userContent.find((item: any) => item.type === "text");
+        const textItem = userContent.find((item: MessageContentItem) => item.type === "text") as TextContentItem | undefined;
         prompt = textItem?.text || "";
         
         images = userContent
-          .filter((item: any) => item.type === "image_url")
-          .map((item: any) => item.image_url?.url || "")
+          .filter((item: MessageContentItem): item is ImageUrlContentItem => item.type === "image_url")
+          .map((item: ImageUrlContentItem) => item.image_url?.url || "")
           .filter(Boolean);
       }
       break;
     }
   }
   return { prompt, images };
+}
+
+// ================= 超时控制辅助函数 =================
+
+/**
+ * 带超时控制的 fetch 函数
+ * @param url 请求 URL
+ * @param options fetch 选项
+ * @param timeoutMs 超时时间（毫秒），默认使用 API_TIMEOUT_MS
+ * @returns Promise<Response>
+ */
+async function fetchWithTimeout(
+  url: string,
+  options: RequestInit,
+  timeoutMs: number = API_TIMEOUT_MS
+): Promise<Response> {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  
+  try {
+    const response = await fetch(url, {
+      ...options,
+      signal: controller.signal,
+    });
+    return response;
+  } finally {
+    clearTimeout(timeoutId);
+  }
 }
 
 // ================= 渠道处理函数 =================
@@ -134,7 +183,7 @@ async function handleVolcEngine(
     watermark: false,
   };
 
-  const response = await fetch(VOLC_API_URL, {
+  const response = await fetchWithTimeout(VOLC_API_URL, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -195,7 +244,7 @@ async function handleGitee(
 
   debug("Gitee", `发送请求到: ${GITEE_API_URL}`);
 
-  const response = await fetch(GITEE_API_URL, {
+  const response = await fetchWithTimeout(GITEE_API_URL, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -264,7 +313,7 @@ async function handleModelScope(
   // 记录生成开始
   logImageGenerationStart("ModelScope", requestId, model, size, prompt.length);
 
-  const submitResponse = await fetch(`${MODELSCOPE_API_URL}/images/generations`, {
+  const submitResponse = await fetchWithTimeout(`${MODELSCOPE_API_URL}/images/generations`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -298,7 +347,7 @@ async function handleModelScope(
     await new Promise(resolve => setTimeout(resolve, 5000));
     pollingAttempts++;
 
-    const checkResponse = await fetch(`${MODELSCOPE_API_URL}/tasks/${taskId}`, {
+    const checkResponse = await fetchWithTimeout(`${MODELSCOPE_API_URL}/tasks/${taskId}`, {
       method: "GET",
       headers: {
         "Authorization": `Bearer ${apiKey}`,
@@ -354,7 +403,7 @@ async function handleChatCompletions(req: Request): Promise<Response> {
   const url = new URL(req.url);
   const requestId = generateRequestId();
 
-  const reqInfo = logRequestStart(req, requestId);
+  logRequestStart(req, requestId);
 
   if (url.pathname !== "/v1/chat/completions") {
     warn("HTTP", `路由不匹配: ${url.pathname}`);
@@ -526,7 +575,7 @@ Deno.addSignalListener("SIGTERM", async () => {
   Deno.exit(0);
 });
 
-Deno.serve({ port: PORT }, async (req: Request) => {
+Deno.serve({ port: PORT }, (req: Request) => {
   if (req.method === "OPTIONS") {
     return new Response(null, {
       headers: {
