@@ -1,8 +1,9 @@
 services:
-  # 火山引擎图像生成 API 中转服务
-  doubao-seedream:
+  # 智能图像生成路由服务
+  img-router:
     build: .
-    container_name: doubao-seedream-proxy
+    image: img-router:latest
+    container_name: img-router-proxy
     ports:
       - "10001:10001"  # 主机 10001 端口 -> 容器 10001 端口
     environment:

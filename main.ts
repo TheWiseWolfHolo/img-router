@@ -249,7 +249,7 @@ async function handleGitee(
     headers: {
       "Content-Type": "application/json",
       "Authorization": `Bearer ${apiKey}`,
-      "User-Agent": "Doubao-Seedream-Proxy/1.0"
+      "User-Agent": "ImgRouter/1.0"
     },
     body: JSON.stringify(giteeRequest),
   });
