@@ -54,6 +54,8 @@ import {
   type ImageInputMode,
 } from "./image_input.ts";
 
+import { resolveImage } from "./image_resolver.ts";
+
 // ================= 类型定义 =================
 
 type Provider = "VolcEngine" | "Gitee" | "ModelScope" | "Unknown";
@@ -271,7 +273,7 @@ async function handleGitee(
     model: model,
     prompt: prompt || "A beautiful scenery",
     // 图生图/编辑：尽量按 OpenAI 兼容扩展字段传递（不同上游可能字段名不同，但通常会忽略未知字段）
-    ...(images.length > 0 ? { image: images } : {}),
+    ...(images.length > 0 ? { image: images[0] } : {}),
     size: size,
     n: 1,
     response_format: "url"
@@ -361,22 +363,116 @@ async function handleModelScope(
   // 记录生成开始
   logImageGenerationStart("ModelScope", requestId, model, size, prompt.length);
 
-  const submitResponse = await fetchWithTimeout(`${ModelScopeConfig.apiUrl}/images/generations`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": `Bearer ${apiKey}`,
-      "X-ModelScope-Async-Mode": "true"
-    },
-    body: JSON.stringify({
-      model: model,
-      prompt: prompt || "A beautiful scenery",
-      ...(images.length > 0 ? { image: images } : {}),
-      response_format: "url",
-      size: size,
-      n: 1
-    }),
-  });
+  const isImageEditModel = model.toLowerCase().includes("image-edit");
+
+  const extractImages = (payload: any): { url?: string; b64_json?: string }[] => {
+    const out: { url?: string; b64_json?: string }[] = [];
+
+    const pushAny = (v: any): void => {
+      if (!v) return;
+      if (typeof v === "string") {
+        if (v.startsWith("data:")) out.push({ b64_json: v });
+        else out.push({ url: v });
+        return;
+      }
+      if (typeof v === "object") {
+        const url = typeof v.url === "string" ? v.url : undefined;
+        const b64 =
+          typeof v.b64_json === "string" ? v.b64_json
+            : (typeof v.base64 === "string" ? v.base64 : undefined);
+        if (url || b64) out.push({ url, b64_json: b64 });
+      }
+    };
+
+    const tryArray = (arr: any): void => {
+      if (!Array.isArray(arr)) return;
+      for (const it of arr) pushAny(it);
+    };
+
+    tryArray(payload?.output_images);
+    tryArray(payload?.output?.output_images);
+    tryArray(payload?.output?.images);
+    tryArray(payload?.output_images);
+    tryArray(payload?.images);
+    tryArray(payload?.data);
+
+    pushAny(payload?.output_image);
+    pushAny(payload?.output?.output_image);
+    pushAny(payload?.output?.image);
+
+    return out.filter((x) => (typeof x.url === "string" && x.url.trim() !== "") ||
+      (typeof x.b64_json === "string" && x.b64_json.trim() !== ""));
+  };
+
+  const imageFetchTimeoutMs = getEnvInt("IMAGE_FETCH_TIMEOUT_MS", 10_000);
+  const maxImageBytes = getEnvInt("MAX_IMAGE_BYTES", 10 * 1024 * 1024);
+  const allowPrivateImageFetch = getEnvBool("ALLOW_PRIVATE_IMAGE_FETCH", false);
+
+  const submitUrl = isImageEditModel
+    ? `${ModelScopeConfig.apiUrl}/images/edits`
+    : `${ModelScopeConfig.apiUrl}/images/generations`;
+
+  const submitHeaders: Record<string, string> = {
+    "Authorization": `Bearer ${apiKey}`,
+    "X-ModelScope-Async-Mode": "true",
+  };
+
+  let submitResponse: Response;
+  if (isImageEditModel) {
+    if (images.length === 0) {
+      throw new Error("ModelScope image edit requires a reference image, but none was provided");
+    }
+
+    const resolved = await resolveImage(images[0]!, {
+      timeoutMs: imageFetchTimeoutMs,
+      maxBytes: maxImageBytes,
+      allowPrivateNetwork: allowPrivateImageFetch,
+    });
+
+    const guessExt = (mime: string): string => {
+      if (mime === "image/png") return "png";
+      if (mime === "image/jpeg") return "jpg";
+      if (mime === "image/webp") return "webp";
+      if (mime === "image/gif") return "gif";
+      return "png";
+    };
+
+    // 这里手动拷贝到 ArrayBuffer，避免 TS 类型把 buffer 推断成 SharedArrayBuffer
+    const ab = new ArrayBuffer(resolved.bytes.byteLength);
+    new Uint8Array(ab).set(resolved.bytes);
+    const blob = new Blob([ab], { type: resolved.mime });
+
+    const imageField = (Deno.env.get("MODELSCOPE_IMAGE_UPLOAD_FIELD") ?? "image").trim() || "image";
+    const form = new FormData();
+    form.set("model", model);
+    form.set("prompt", prompt || "A beautiful scenery");
+    form.set("n", "1");
+    form.set("size", size);
+    form.set("response_format", "url");
+    form.set(imageField, blob, `image.${guessExt(resolved.mime)}`);
+
+    submitResponse = await fetchWithTimeout(submitUrl, {
+      method: "POST",
+      headers: submitHeaders,
+      body: form,
+    });
+  } else {
+    submitResponse = await fetchWithTimeout(submitUrl, {
+      method: "POST",
+      headers: {
+        ...submitHeaders,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: model,
+        prompt: prompt || "A beautiful scenery",
+        ...(images.length > 0 ? { image: images[0] } : {}),
+        response_format: "url",
+        size: size,
+        n: 1,
+      }),
+    });
+  }
 
   if (!submitResponse.ok) {
     const errorText = await submitResponse.text();
@@ -387,7 +483,29 @@ async function handleModelScope(
   }
 
   const submitData = await submitResponse.json();
+
+  // 兼容：如果不返回 task_id（同步返回），直接尝试解析图片
   const taskId = submitData.task_id;
+  if (!taskId) {
+    const imageData = extractImages(submitData);
+    if (imageData.length > 0) {
+      logGeneratedImages("ModelScope", requestId, imageData);
+      const result = imageData.map((img) => {
+        if (img.url) return `![Generated Image](${img.url})`;
+        if (img.b64_json) {
+          const v = img.b64_json.startsWith("data:")
+            ? img.b64_json
+            : `data:image/png;base64,${img.b64_json}`;
+          return `![Generated Image](${v})`;
+        }
+        return "";
+      }).filter(Boolean).join("\n\n");
+      logApiCallEnd("ModelScope", "generate_image", true, Date.now() - startTime);
+      return result || "图片生成失败";
+    }
+    throw new Error(`ModelScope unexpected response without task_id: ${JSON.stringify(Object.keys(submitData ?? {}))}`);
+  }
+
   info("ModelScope", `任务已提交, Task ID: ${taskId}`);
 
   const maxAttempts = 60;
@@ -426,47 +544,6 @@ async function handleModelScope(
     const status = checkData.task_status;
 
     if (status === "SUCCEED") {
-      const extractImages = (payload: any): { url?: string; b64_json?: string }[] => {
-        const out: { url?: string; b64_json?: string }[] = [];
-
-        const pushAny = (v: any): void => {
-          if (!v) return;
-          if (typeof v === "string") {
-            // URL 或 dataURL
-            if (v.startsWith("data:")) out.push({ b64_json: v });
-            else out.push({ url: v });
-            return;
-          }
-          if (typeof v === "object") {
-            const url = typeof v.url === "string" ? v.url : undefined;
-            const b64 =
-              typeof v.b64_json === "string" ? v.b64_json
-                : (typeof v.base64 === "string" ? v.base64 : undefined);
-            if (url || b64) out.push({ url, b64_json: b64 });
-          }
-        };
-
-        const tryArray = (arr: any): void => {
-          if (!Array.isArray(arr)) return;
-          for (const it of arr) pushAny(it);
-        };
-
-        tryArray(payload?.output_images);
-        tryArray(payload?.output?.output_images);
-        tryArray(payload?.output?.images);
-        tryArray(payload?.output_images);
-        tryArray(payload?.images);
-        tryArray(payload?.data);
-
-        // 兼容单个字段
-        pushAny(payload?.output_image);
-        pushAny(payload?.output?.output_image);
-        pushAny(payload?.output?.image);
-
-        return out.filter((x) => (typeof x.url === "string" && x.url.trim() !== "") ||
-          (typeof x.b64_json === "string" && x.b64_json.trim() !== ""));
-      };
-
       const imageData = extractImages(checkData);
 
       if (imageData.length === 0) {
