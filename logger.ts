@@ -147,7 +147,19 @@ export function logFullPrompt(provider: string, requestId: string, prompt: strin
  */
 export function logInputImages(provider: string, requestId: string, images: string[]): void {
   if (images.length > 0) {
-    const imageList = images.map((url, i) => `  ${i + 1}. ${url}`).join("\n");
+    const summarize = (ref: string): string => {
+      if (ref.startsWith("data:")) {
+        const comma = ref.indexOf(",");
+        const meta = comma >= 0 ? ref.slice(5, comma) : "unknown";
+        const b64Len = comma >= 0 ? (ref.length - comma - 1) : ref.length;
+        return `data:${meta},... (len=${b64Len})`;
+      }
+      if (ref.length > 200) {
+        return `${ref.slice(0, 200)}... (len=${ref.length})`;
+      }
+      return ref;
+    };
+    const imageList = images.map((url, i) => `  ${i + 1}. ${summarize(url)}`).join("\n");
     writeLog(LogLevel.INFO, provider, `\n📷 输入图片 (${requestId}):\n${imageList}`);
   }
 }

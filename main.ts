@@ -38,36 +38,25 @@ import {
   PORT,
 } from "./config.ts";
 
+import {
+  normalizeChatRequest,
+  extractLastUserPromptAndImages,
+  type NormalizedChatRequest,
+} from "./normalizer.ts";
+
+import { parseChatRequestBody } from "./request_parser.ts";
+
+import {
+  prepareImagesForUpstream,
+  parseImageInputMode,
+  parseImageBase64Format,
+  type ImageBase64Format,
+  type ImageInputMode,
+} from "./image_input.ts";
+
 // ================= 类型定义 =================
 
 type Provider = "VolcEngine" | "Gitee" | "ModelScope" | "Unknown";
-
-// 消息内容项类型
-interface TextContentItem {
-  type: "text";
-  text: string;
-}
-
-interface ImageUrlContentItem {
-  type: "image_url";
-  image_url?: { url: string };
-}
-
-type MessageContentItem = TextContentItem | ImageUrlContentItem;
-
-// 消息类型
-interface Message {
-  role: string;
-  content: string | MessageContentItem[];
-}
-
-interface ChatRequest {
-  model?: string;
-  messages: Message[];
-  stream?: boolean;
-  size?: string;
-  [key: string]: unknown;
-}
 
 // ================= 核心逻辑 =================
 
@@ -95,28 +84,46 @@ function detectProvider(apiKey: string): Provider {
   return "Unknown";
 }
 
-function extractPromptAndImages(messages: Message[]): { prompt: string; images: string[] } {
-  let prompt = "";
-  let images: string[] = [];
+function getEnvInt(name: string, fallback: number): number {
+  const raw = Deno.env.get(name);
+  const n = Number.parseInt((raw ?? "").trim(), 10);
+  return Number.isFinite(n) ? n : fallback;
+}
 
-  for (let i = messages.length - 1; i >= 0; i--) {
-    if (messages[i].role === "user") {
-      const userContent = messages[i].content;
-      if (typeof userContent === "string") {
-        prompt = userContent;
-      } else if (Array.isArray(userContent)) {
-        const textItem = userContent.find((item: MessageContentItem) => item.type === "text") as TextContentItem | undefined;
-        prompt = textItem?.text || "";
-        
-        images = userContent
-          .filter((item: MessageContentItem): item is ImageUrlContentItem => item.type === "image_url")
-          .map((item: ImageUrlContentItem) => item.image_url?.url || "")
-          .filter(Boolean);
-      }
-      break;
-    }
-  }
-  return { prompt, images };
+function getEnvBool(name: string, fallback: boolean): boolean {
+  const raw = (Deno.env.get(name) ?? "").trim().toLowerCase();
+  if (raw === "") return fallback;
+  if (raw === "1" || raw === "true" || raw === "yes" || raw === "on") return true;
+  if (raw === "0" || raw === "false" || raw === "no" || raw === "off") return false;
+  return fallback;
+}
+
+function getProviderImageInputMode(provider: Provider): ImageInputMode {
+  const globalMode = parseImageInputMode(Deno.env.get("IMAGE_INPUT_MODE"), "fetch_to_base64");
+  const perProviderKey = provider === "VolcEngine"
+    ? "VOLCENGINE_IMAGE_INPUT_MODE"
+    : provider === "Gitee"
+    ? "GITEE_IMAGE_INPUT_MODE"
+    : provider === "ModelScope"
+    ? "MODELSCOPE_IMAGE_INPUT_MODE"
+    : undefined;
+
+  const per = perProviderKey ? Deno.env.get(perProviderKey) : undefined;
+  return parseImageInputMode(per, globalMode);
+}
+
+function getProviderImageBase64Format(provider: Provider): ImageBase64Format {
+  const globalFmt = parseImageBase64Format(Deno.env.get("IMAGE_BASE64_FORMAT"), "data_url");
+  const perProviderKey = provider === "VolcEngine"
+    ? "VOLCENGINE_IMAGE_BASE64_FORMAT"
+    : provider === "Gitee"
+    ? "GITEE_IMAGE_BASE64_FORMAT"
+    : provider === "ModelScope"
+    ? "MODELSCOPE_IMAGE_BASE64_FORMAT"
+    : undefined;
+
+  const per = perProviderKey ? Deno.env.get(perProviderKey) : undefined;
+  return parseImageBase64Format(per, globalFmt);
 }
 
 // ================= 超时控制辅助函数 =================
@@ -151,7 +158,7 @@ async function fetchWithTimeout(
 
 async function handleVolcEngine(
   apiKey: string,
-  reqBody: ChatRequest,
+  reqBody: NormalizedChatRequest,
   prompt: string,
   images: string[],
   requestId: string
@@ -220,8 +227,9 @@ async function handleVolcEngine(
 
 async function handleGitee(
   apiKey: string,
-  reqBody: ChatRequest,
+  reqBody: NormalizedChatRequest,
   prompt: string,
+  images: string[],
   requestId: string
 ): Promise<string> {
   const startTime = Date.now();
@@ -229,6 +237,9 @@ async function handleGitee(
 
   // 记录完整 Prompt
   logFullPrompt("Gitee", requestId, prompt);
+
+  // 记录输入图片（图生图）
+  logInputImages("Gitee", requestId, images);
   
   // 使用配置中的默认模型，支持多模型
   const model = reqBody.model && GiteeConfig.supportedModels.includes(reqBody.model)
@@ -242,6 +253,8 @@ async function handleGitee(
   const giteeRequest = {
     model: model,
     prompt: prompt || "A beautiful scenery",
+    // 图生图/编辑：尽量按 OpenAI 兼容扩展字段传递（不同上游可能字段名不同，但通常会忽略未知字段）
+    ...(images.length > 0 ? { image: images } : {}),
     size: size,
     n: 1,
     response_format: "url"
@@ -302,8 +315,9 @@ async function handleGitee(
 
 async function handleModelScope(
   apiKey: string,
-  reqBody: ChatRequest,
+  reqBody: NormalizedChatRequest,
   prompt: string,
+  images: string[],
   requestId: string
 ): Promise<string> {
   const startTime = Date.now();
@@ -311,6 +325,9 @@ async function handleModelScope(
 
   // 记录完整 Prompt
   logFullPrompt("ModelScope", requestId, prompt);
+
+  // 记录输入图片（图生图）
+  logInputImages("ModelScope", requestId, images);
   
   // 使用配置中的默认模型，支持多模型
   const model = reqBody.model && ModelScopeConfig.supportedModels.includes(reqBody.model)
@@ -331,6 +348,7 @@ async function handleModelScope(
     body: JSON.stringify({
       model: model,
       prompt: prompt || "A beautiful scenery",
+      ...(images.length > 0 ? { image: images } : {}),
       size: size,
       n: 1
     }),
@@ -447,9 +465,31 @@ async function handleChatCompletions(req: Request): Promise<Response> {
   info("HTTP", `路由到 ${provider}`);
 
   try {
-    const requestBody: ChatRequest = await req.json();
+    const parsed = await parseChatRequestBody(req);
+    if (parsed.warnings.length > 0) {
+      for (const w of parsed.warnings) warn("HTTP", `${requestId} multipart warning: ${w}`);
+    }
+    if (parsed.injectedImageCount > 0) {
+      info("HTTP", `${requestId} multipart 注入图片数量: ${parsed.injectedImageCount}`);
+    }
+
+    const requestBody = normalizeChatRequest(parsed.body);
     const isStream = requestBody.stream === true;
-    const { prompt, images } = extractPromptAndImages(requestBody.messages || []);
+    const { prompt, images } = extractLastUserPromptAndImages(requestBody.messages || []);
+
+    const imageMode = getProviderImageInputMode(provider);
+    const base64Format = getProviderImageBase64Format(provider);
+    const imageFetchTimeoutMs = getEnvInt("IMAGE_FETCH_TIMEOUT_MS", 10_000);
+    const maxImageBytes = getEnvInt("MAX_IMAGE_BYTES", 10 * 1024 * 1024);
+    const allowPrivateImageFetch = getEnvBool("ALLOW_PRIVATE_IMAGE_FETCH", false);
+
+    const upstreamImages = await prepareImagesForUpstream(images, {
+      mode: imageMode,
+      base64Format,
+      timeoutMs: imageFetchTimeoutMs,
+      maxBytes: maxImageBytes,
+      allowPrivateNetwork: allowPrivateImageFetch,
+    });
 
     // 记录完整 Prompt（DEBUG 级别只记录摘要）
     debug("Router", `提取 Prompt: ${prompt?.substring(0, 80)}... (完整长度: ${prompt?.length || 0})`);
@@ -458,13 +498,13 @@ async function handleChatCompletions(req: Request): Promise<Response> {
     
     switch (provider) {
       case "VolcEngine":
-        imageContent = await handleVolcEngine(apiKey, requestBody, prompt, images, requestId);
+        imageContent = await handleVolcEngine(apiKey, requestBody, prompt, upstreamImages, requestId);
         break;
       case "Gitee":
-        imageContent = await handleGitee(apiKey, requestBody, prompt, requestId);
+        imageContent = await handleGitee(apiKey, requestBody, prompt, upstreamImages, requestId);
         break;
       case "ModelScope":
-        imageContent = await handleModelScope(apiKey, requestBody, prompt, requestId);
+        imageContent = await handleModelScope(apiKey, requestBody, prompt, upstreamImages, requestId);
         break;
     }
 
@@ -584,6 +624,16 @@ Deno.addSignalListener("SIGTERM", async () => {
 });
 
 Deno.serve({ port: PORT }, (req: Request) => {
+  const url = new URL(req.url);
+  if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/healthz")) {
+    return new Response("ok", {
+      headers: {
+        "Content-Type": "text/plain",
+        "Access-Control-Allow-Origin": "*",
+      },
+    });
+  }
+
   if (req.method === "OPTIONS") {
     return new Response(null, {
       headers: {

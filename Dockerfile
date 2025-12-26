@@ -7,6 +7,11 @@ WORKDIR /app
 # 复制应用代码
 COPY main.ts .
 COPY config.ts .
+COPY base64.ts .
+COPY normalizer.ts .
+COPY request_parser.ts .
+COPY image_resolver.ts .
+COPY image_input.ts .
 COPY deno.json .
 COPY logger.ts .
 

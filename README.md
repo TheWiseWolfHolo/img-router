@@ -46,7 +46,7 @@
 ### Docker Compose (推荐)
 
 ```bash
-git clone https://github.com/lianwusuoai/img-router.git
+git clone https://github.com/TheWiseWolfHolo/img-router.git
 cd img-router
 docker-compose up -d
 ```
@@ -118,6 +118,21 @@ curl -X POST http://localhost:10001/v1/chat/completions \
   }'
 ```
 
+### multipart/form-data（兼容部分客户端文件上传）
+
+当客户端以表单上传图片时：
+- `payload`: 原始 OpenAI 兼容请求 JSON 字符串
+- `file`/`image`: 图片文件（可多文件）
+
+示例：
+
+```bash
+curl -X POST http://localhost:10001/v1/chat/completions \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -F 'payload={"model":"doubao-seedream-4-0-250828","messages":[{"role":"user","content":"转换为水彩画风格"}]}' \
+  -F "image=@./input.png;type=image/png"
+```
+
 ## API Key 格式
 
 | 渠道 | 格式 | 示例 |
@@ -136,6 +151,13 @@ curl -X POST http://localhost:10001/v1/chat/completions \
 |------|------|--------|
 | `PORT` | 监听端口 | `10001` |
 | `LOG_LEVEL` | 日志级别 | `INFO` |
+| `IMAGE_INPUT_MODE` | 图片输入策略：`passthrough`/`fetch_to_base64` | `fetch_to_base64` |
+| `IMAGE_BASE64_FORMAT` | base64 提交格式：`data_url`/`raw_base64` | `data_url` |
+| `IMAGE_FETCH_TIMEOUT_MS` | 拉取远程图片超时（毫秒） | `10000` |
+| `MAX_IMAGE_BYTES` | 图片最大体积（字节） | `10485760` (10MB) |
+| `ALLOW_PRIVATE_IMAGE_FETCH` | 是否允许拉取 localhost/内网地址（不建议开启） | `false` |
+
+> 可按渠道覆盖：`VOLCENGINE_IMAGE_INPUT_MODE` / `GITEE_IMAGE_INPUT_MODE` / `MODELSCOPE_IMAGE_INPUT_MODE`，以及 `*_IMAGE_BASE64_FORMAT`。
 
 ### 默认模型
 

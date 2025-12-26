@@ -1,3 +1,20 @@
+# runtime data
+data/
+*.log
+
+# env
+.env
+.env.*
+
+# editor / os
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# deno (only if user sets DENO_DIR in project)
+.deno_dir/
+
 # 日志和数据文件
 data/
 *.log

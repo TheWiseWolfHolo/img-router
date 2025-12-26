@@ -40,4 +40,11 @@ export const ModelScopeConfig: ProviderConfig = {
 export const API_TIMEOUT_MS = 120000;
 
 // 服务端口
-export const PORT = parseInt(Deno.env.get("PORT") || "10001");
+function parsePort(value: string | undefined, fallback: number): number {
+  const parsed = Number.parseInt(value ?? String(fallback), 10);
+  if (!Number.isFinite(parsed)) return fallback;
+  if (parsed <= 0 || parsed > 65535) return fallback;
+  return parsed;
+}
+
+export const PORT = parsePort(Deno.env.get("PORT"), 10001);
