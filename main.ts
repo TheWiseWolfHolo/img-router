@@ -407,31 +407,92 @@ async function handleModelScope(
     "X-ModelScope-Async-Mode": "true",
   };
 
-  const isUrlLike = (v: string): boolean =>
-    v.startsWith("http://") || v.startsWith("https://") || v.startsWith("data:");
+  // ModelScope 的 image_url 通常期望可被其服务端拉取的 http(s) URL；dataURL/base64 建议走 image 字段。
+  const isHttpUrl = (v: string): boolean => v.startsWith("http://") || v.startsWith("https://");
 
-  const imageUrlList = images.filter(isUrlLike);
-  const rawImage = images.find((v) => !isUrlLike(v));
+  const imageUrlList = images.filter(isHttpUrl);
+  const rawImage = images.find((v) => !isHttpUrl(v));
 
   // ModelScope 的 Qwen Image Edit 系列通常走 /images/generations，并使用 image_url 传入参考图
   // 参考：ModelScope 社区示例（/v1/images/generations + image_url）
   // https://modelscope.csdn.net/691c36ee82fbe0098caca391.html
-  const submitResponse = await fetchWithTimeout(submitUrlGenerations, {
+  const buildSubmitBody = (useImageUrl: boolean): Record<string, unknown> => {
+    const body: Record<string, unknown> = {
+      model: model,
+      prompt: prompt || "A beautiful scenery",
+      response_format: "url",
+      size: size,
+      n: 1,
+    };
+
+    if (useImageUrl) {
+      if (imageUrlList.length > 0) body.image_url = imageUrlList;
+      // 兜底：少数情况下（客户端只给 dataURL）也允许把 dataURL 放入 image_url 试一次
+      else if (rawImage) body.image_url = [rawImage];
+    } else {
+      if (rawImage) body.image = rawImage;
+      // 如果只有 http(s) URL，也兜底传到 image（部分网关可能支持）
+      else if (imageUrlList.length > 0) body.image = imageUrlList[0];
+    }
+
+    return body;
+  };
+
+  // 优先策略：有 http(s) URL 则走 image_url；否则（dataURL/base64）走 image
+  const preferImageUrl = imageUrlList.length > 0;
+  const primaryBody = buildSubmitBody(preferImageUrl);
+
+  debug(
+    "ModelScope",
+    `提交生成: model=${model} prefer=${preferImageUrl ? "image_url" : "image"} image_url_count=${imageUrlList.length} raw_image_len=${rawImage?.length ?? 0}`,
+  );
+
+  let submitResponse = await fetchWithTimeout(submitUrlGenerations, {
     method: "POST",
     headers: {
       ...submitHeaders,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({
-      model: model,
-      prompt: prompt || "A beautiful scenery",
-      ...(imageUrlList.length > 0 ? { image_url: imageUrlList } : {}),
-      ...(rawImage ? { image: rawImage } : {}),
-      response_format: "url",
-      size: size,
-      n: 1,
-    }),
+    body: JSON.stringify(primaryBody),
   });
+
+  // 轻量兜底：如果 400 且返回看不出具体原因，则尝试切换字段再提交一次
+  if (!submitResponse.ok && submitResponse.status === 400) {
+    const firstText = await submitResponse.text().catch(() => "");
+    const shouldRetry = (rawImage != null) || (imageUrlList.length > 0);
+
+    if (shouldRetry) {
+      warn(
+        "ModelScope",
+        `首次提交 400，尝试切换字段重试一次。first_error=${firstText || "<empty>"}`,
+      );
+      const retryBody = buildSubmitBody(!preferImageUrl);
+      submitResponse = await fetchWithTimeout(submitUrlGenerations, {
+        method: "POST",
+        headers: {
+          ...submitHeaders,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(retryBody),
+      });
+
+      if (!submitResponse.ok) {
+        const errorText = await submitResponse.text().catch(() => "");
+        const err = new Error(`ModelScope Submit Error (${submitResponse.status}): ${errorText}`);
+        logImageGenerationFailed("ModelScope", requestId, errorText);
+        logApiCallEnd("ModelScope", "generate_image", false, Date.now() - startTime);
+        throw err;
+      }
+
+      // 重试成功：继续走后续 json/轮询逻辑
+    } else {
+      // 没有可重试条件：直接抛出首错
+      const err = new Error(`ModelScope Submit Error (${submitResponse.status}): ${firstText}`);
+      logImageGenerationFailed("ModelScope", requestId, firstText);
+      logApiCallEnd("ModelScope", "generate_image", false, Date.now() - startTime);
+      throw err;
+    }
+  }
 
   if (!submitResponse.ok) {
     const errorText = await submitResponse.text();
