@@ -408,9 +408,8 @@ async function handleModelScope(
   const maxImageBytes = getEnvInt("MAX_IMAGE_BYTES", 10 * 1024 * 1024);
   const allowPrivateImageFetch = getEnvBool("ALLOW_PRIVATE_IMAGE_FETCH", false);
 
-  const submitUrl = isImageEditModel
-    ? `${ModelScopeConfig.apiUrl}/images/edits`
-    : `${ModelScopeConfig.apiUrl}/images/generations`;
+  const submitUrlGenerations = `${ModelScopeConfig.apiUrl}/images/generations`;
+  const submitUrlEdits = `${ModelScopeConfig.apiUrl}/images/edits`;
 
   const submitHeaders: Record<string, string> = {
     "Authorization": `Bearer ${apiKey}`,
@@ -451,13 +450,32 @@ async function handleModelScope(
     form.set("response_format", "url");
     form.set(imageField, blob, `image.${guessExt(resolved.mime)}`);
 
-    submitResponse = await fetchWithTimeout(submitUrl, {
+    // 兼容：部分网关未实现 /images/edits（会 404），但同模型可在 /images/generations 通过 multipart 方式工作
+    const preferredEditEndpoint = (Deno.env.get("MODELSCOPE_IMAGE_EDIT_ENDPOINT") ?? "edits").trim()
+      .toLowerCase();
+    const firstUrl = preferredEditEndpoint === "generations" ? submitUrlGenerations : submitUrlEdits;
+    const fallbackUrl = firstUrl === submitUrlEdits ? submitUrlGenerations : submitUrlEdits;
+
+    submitResponse = await fetchWithTimeout(firstUrl, {
       method: "POST",
       headers: submitHeaders,
       body: form,
     });
+
+    if (submitResponse.status === 404) {
+      const text = await submitResponse.text().catch(() => "");
+      warn(
+        "ModelScope",
+        `Image-Edit endpoint 404 (${firstUrl})，自动回退到 ${fallbackUrl}. body=${text || "<empty>"}`,
+      );
+      submitResponse = await fetchWithTimeout(fallbackUrl, {
+        method: "POST",
+        headers: submitHeaders,
+        body: form,
+      });
+    }
   } else {
-    submitResponse = await fetchWithTimeout(submitUrl, {
+    submitResponse = await fetchWithTimeout(submitUrlGenerations, {
       method: "POST",
       headers: {
         ...submitHeaders,
@@ -511,11 +529,13 @@ async function handleModelScope(
   const maxAttempts = 60;
   let pollingAttempts = 0;
   
+  const defaultTaskType = isImageEditModel ? "image_edit" : "image_generation";
+
   for (let i = 0; i < maxAttempts; i++) {
     await new Promise(resolve => setTimeout(resolve, 5000));
     pollingAttempts++;
 
-    const configuredTaskType = (Deno.env.get("MODELSCOPE_TASK_TYPE") ?? "image_generation").trim();
+    const configuredTaskType = (Deno.env.get("MODELSCOPE_TASK_TYPE") ?? defaultTaskType).trim();
     const baseHeaders: Record<string, string> = {
       "Authorization": `Bearer ${apiKey}`,
     };
