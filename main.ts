@@ -98,6 +98,11 @@ function getEnvBool(name: string, fallback: boolean): boolean {
   return fallback;
 }
 
+function enforceSupportedModels(): boolean {
+  // 默认不强制（允许透传任意 model，避免出现“被强制路由到默认模型”的问题）
+  return getEnvBool("ENFORCE_SUPPORTED_MODELS", false);
+}
+
 function getProviderImageInputMode(provider: Provider): ImageInputMode {
   const globalMode = parseImageInputMode(Deno.env.get("IMAGE_INPUT_MODE"), "fetch_to_base64");
   const perProviderKey = provider === "VolcEngine"
@@ -173,8 +178,14 @@ async function handleVolcEngine(
   logInputImages("VolcEngine", requestId, images);
   
   // 使用配置中的默认模型，支持多模型
-  const model = reqBody.model && VolcEngineConfig.supportedModels.includes(reqBody.model)
-    ? reqBody.model
+  const requestedModel = reqBody.model?.trim();
+  const model = requestedModel
+    ? (!enforceSupportedModels() || VolcEngineConfig.supportedModels.includes(requestedModel)
+      ? requestedModel
+      : (warn(
+        "VolcEngine",
+        `请求模型不在 supportedModels 中，已回退默认模型: ${requestedModel} -> ${VolcEngineConfig.defaultModel}（如需透传任意模型请设置 ENFORCE_SUPPORTED_MODELS=false）`,
+      ), VolcEngineConfig.defaultModel))
     : VolcEngineConfig.defaultModel;
   const size = reqBody.size || "4096x4096";
   
@@ -242,8 +253,14 @@ async function handleGitee(
   logInputImages("Gitee", requestId, images);
   
   // 使用配置中的默认模型，支持多模型
-  const model = reqBody.model && GiteeConfig.supportedModels.includes(reqBody.model)
-    ? reqBody.model
+  const requestedModel = reqBody.model?.trim();
+  const model = requestedModel
+    ? (!enforceSupportedModels() || GiteeConfig.supportedModels.includes(requestedModel)
+      ? requestedModel
+      : (warn(
+        "Gitee",
+        `请求模型不在 supportedModels 中，已回退默认模型: ${requestedModel} -> ${GiteeConfig.defaultModel}（如需透传任意模型请设置 ENFORCE_SUPPORTED_MODELS=false）`,
+      ), GiteeConfig.defaultModel))
     : GiteeConfig.defaultModel;
   const size = reqBody.size || "2048x2048";
   
@@ -330,8 +347,14 @@ async function handleModelScope(
   logInputImages("ModelScope", requestId, images);
   
   // 使用配置中的默认模型，支持多模型
-  const model = reqBody.model && ModelScopeConfig.supportedModels.includes(reqBody.model)
-    ? reqBody.model
+  const requestedModel = reqBody.model?.trim();
+  const model = requestedModel
+    ? (!enforceSupportedModels() || ModelScopeConfig.supportedModels.includes(requestedModel)
+      ? requestedModel
+      : (warn(
+        "ModelScope",
+        `请求模型不在 supportedModels 中，已回退默认模型: ${requestedModel} -> ${ModelScopeConfig.defaultModel}（如需透传任意模型请设置 ENFORCE_SUPPORTED_MODELS=false）`,
+      ), ModelScopeConfig.defaultModel))
     : ModelScopeConfig.defaultModel;
   const size = reqBody.size || "2048x2048";
   
@@ -349,6 +372,7 @@ async function handleModelScope(
       model: model,
       prompt: prompt || "A beautiful scenery",
       ...(images.length > 0 ? { image: images } : {}),
+      response_format: "url",
       size: size,
       n: 1
     }),
@@ -373,13 +397,25 @@ async function handleModelScope(
     await new Promise(resolve => setTimeout(resolve, 5000));
     pollingAttempts++;
 
-    const checkResponse = await fetchWithTimeout(`${ModelScopeConfig.apiUrl}/tasks/${taskId}`, {
+    const configuredTaskType = (Deno.env.get("MODELSCOPE_TASK_TYPE") ?? "image_generation").trim();
+    const baseHeaders: Record<string, string> = {
+      "Authorization": `Bearer ${apiKey}`,
+    };
+    const headersWithType = configuredTaskType
+      ? { ...baseHeaders, "X-ModelScope-Task-Type": configuredTaskType }
+      : baseHeaders;
+
+    // 有些场景 task_type 可能不需要/不匹配：失败时自动降级为不带该头再试一次
+    let checkResponse = await fetchWithTimeout(`${ModelScopeConfig.apiUrl}/tasks/${taskId}`, {
       method: "GET",
-      headers: {
-        "Authorization": `Bearer ${apiKey}`,
-        "X-ModelScope-Task-Type": "image_generation"
-      }
+      headers: headersWithType,
     });
+    if (!checkResponse.ok && configuredTaskType) {
+      checkResponse = await fetchWithTimeout(`${ModelScopeConfig.apiUrl}/tasks/${taskId}`, {
+        method: "GET",
+        headers: baseHeaders,
+      });
+    }
 
     if (!checkResponse.ok) {
       warn("ModelScope", `轮询警告: ${checkResponse.status}`);
@@ -390,18 +426,77 @@ async function handleModelScope(
     const status = checkData.task_status;
 
     if (status === "SUCCEED") {
-      const imageUrls = checkData.output_images || [];
-      
-      // 记录生成的图片 URL
-      const imageData = imageUrls.map((url: string) => ({ url }));
+      const extractImages = (payload: any): { url?: string; b64_json?: string }[] => {
+        const out: { url?: string; b64_json?: string }[] = [];
+
+        const pushAny = (v: any): void => {
+          if (!v) return;
+          if (typeof v === "string") {
+            // URL 或 dataURL
+            if (v.startsWith("data:")) out.push({ b64_json: v });
+            else out.push({ url: v });
+            return;
+          }
+          if (typeof v === "object") {
+            const url = typeof v.url === "string" ? v.url : undefined;
+            const b64 =
+              typeof v.b64_json === "string" ? v.b64_json
+                : (typeof v.base64 === "string" ? v.base64 : undefined);
+            if (url || b64) out.push({ url, b64_json: b64 });
+          }
+        };
+
+        const tryArray = (arr: any): void => {
+          if (!Array.isArray(arr)) return;
+          for (const it of arr) pushAny(it);
+        };
+
+        tryArray(payload?.output_images);
+        tryArray(payload?.output?.output_images);
+        tryArray(payload?.output?.images);
+        tryArray(payload?.output_images);
+        tryArray(payload?.images);
+        tryArray(payload?.data);
+
+        // 兼容单个字段
+        pushAny(payload?.output_image);
+        pushAny(payload?.output?.output_image);
+        pushAny(payload?.output?.image);
+
+        return out.filter((x) => (typeof x.url === "string" && x.url.trim() !== "") ||
+          (typeof x.b64_json === "string" && x.b64_json.trim() !== ""));
+      };
+
+      const imageData = extractImages(checkData);
+
+      if (imageData.length === 0) {
+        // 帮助排查：仅打印 key，不打印完整 payload（避免日志爆炸）
+        const keys = Object.keys(checkData ?? {}).slice(0, 30);
+        warn(
+          "ModelScope",
+          `任务 SUCCEED 但未解析到图片输出，checkData keys=${JSON.stringify(keys)}`,
+        );
+      }
+
       logGeneratedImages("ModelScope", requestId, imageData);
-      
+
       const duration = Date.now() - startTime;
-      const imageCount = imageUrls.length;
+      const imageCount = imageData.length;
       logImageGenerationComplete("ModelScope", requestId, imageCount, duration);
-      
-      const result = imageUrls.map((url: string) => `![Generated Image](${url})`).join("\n\n") || "图片生成失败";
-      
+
+      const toMarkdown = (img: { url?: string; b64_json?: string }): string => {
+        if (img.url) return `![Generated Image](${img.url})`;
+        if (img.b64_json) {
+          const v = img.b64_json.startsWith("data:")
+            ? img.b64_json
+            : `data:image/png;base64,${img.b64_json}`;
+          return `![Generated Image](${v})`;
+        }
+        return "";
+      };
+
+      const result = imageData.map(toMarkdown).filter(Boolean).join("\n\n") || "图片生成失败";
+
       info("ModelScope", `任务成功完成, 耗时: ${pollingAttempts}次轮询`);
       logApiCallEnd("ModelScope", "generate_image", true, duration);
       return result;
