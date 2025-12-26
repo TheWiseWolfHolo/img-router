@@ -54,8 +54,6 @@ import {
   type ImageInputMode,
 } from "./image_input.ts";
 
-import { resolveImage } from "./image_resolver.ts";
-
 // ================= 类型定义 =================
 
 type Provider = "VolcEngine" | "Gitee" | "ModelScope" | "Unknown";
@@ -363,8 +361,6 @@ async function handleModelScope(
   // 记录生成开始
   logImageGenerationStart("ModelScope", requestId, model, size, prompt.length);
 
-  const isImageEditModel = model.toLowerCase().includes("image-edit");
-
   const extractImages = (payload: any): { url?: string; b64_json?: string }[] => {
     const out: { url?: string; b64_json?: string }[] = [];
 
@@ -404,93 +400,38 @@ async function handleModelScope(
       (typeof x.b64_json === "string" && x.b64_json.trim() !== ""));
   };
 
-  const imageFetchTimeoutMs = getEnvInt("IMAGE_FETCH_TIMEOUT_MS", 10_000);
-  const maxImageBytes = getEnvInt("MAX_IMAGE_BYTES", 10 * 1024 * 1024);
-  const allowPrivateImageFetch = getEnvBool("ALLOW_PRIVATE_IMAGE_FETCH", false);
-
   const submitUrlGenerations = `${ModelScopeConfig.apiUrl}/images/generations`;
-  const submitUrlEdits = `${ModelScopeConfig.apiUrl}/images/edits`;
 
   const submitHeaders: Record<string, string> = {
     "Authorization": `Bearer ${apiKey}`,
     "X-ModelScope-Async-Mode": "true",
   };
 
-  let submitResponse: Response;
-  if (isImageEditModel) {
-    if (images.length === 0) {
-      throw new Error("ModelScope image edit requires a reference image, but none was provided");
-    }
+  const isUrlLike = (v: string): boolean =>
+    v.startsWith("http://") || v.startsWith("https://") || v.startsWith("data:");
 
-    const resolved = await resolveImage(images[0]!, {
-      timeoutMs: imageFetchTimeoutMs,
-      maxBytes: maxImageBytes,
-      allowPrivateNetwork: allowPrivateImageFetch,
-    });
+  const imageUrlList = images.filter(isUrlLike);
+  const rawImage = images.find((v) => !isUrlLike(v));
 
-    const guessExt = (mime: string): string => {
-      if (mime === "image/png") return "png";
-      if (mime === "image/jpeg") return "jpg";
-      if (mime === "image/webp") return "webp";
-      if (mime === "image/gif") return "gif";
-      return "png";
-    };
-
-    // 这里手动拷贝到 ArrayBuffer，避免 TS 类型把 buffer 推断成 SharedArrayBuffer
-    const ab = new ArrayBuffer(resolved.bytes.byteLength);
-    new Uint8Array(ab).set(resolved.bytes);
-    const blob = new Blob([ab], { type: resolved.mime });
-
-    const imageField = (Deno.env.get("MODELSCOPE_IMAGE_UPLOAD_FIELD") ?? "image").trim() || "image";
-    const form = new FormData();
-    form.set("model", model);
-    form.set("prompt", prompt || "A beautiful scenery");
-    form.set("n", "1");
-    form.set("size", size);
-    form.set("response_format", "url");
-    form.set(imageField, blob, `image.${guessExt(resolved.mime)}`);
-
-    // 兼容：部分网关未实现 /images/edits（会 404），但同模型可在 /images/generations 通过 multipart 方式工作
-    const preferredEditEndpoint = (Deno.env.get("MODELSCOPE_IMAGE_EDIT_ENDPOINT") ?? "edits").trim()
-      .toLowerCase();
-    const firstUrl = preferredEditEndpoint === "generations" ? submitUrlGenerations : submitUrlEdits;
-    const fallbackUrl = firstUrl === submitUrlEdits ? submitUrlGenerations : submitUrlEdits;
-
-    submitResponse = await fetchWithTimeout(firstUrl, {
-      method: "POST",
-      headers: submitHeaders,
-      body: form,
-    });
-
-    if (submitResponse.status === 404) {
-      const text = await submitResponse.text().catch(() => "");
-      warn(
-        "ModelScope",
-        `Image-Edit endpoint 404 (${firstUrl})，自动回退到 ${fallbackUrl}. body=${text || "<empty>"}`,
-      );
-      submitResponse = await fetchWithTimeout(fallbackUrl, {
-        method: "POST",
-        headers: submitHeaders,
-        body: form,
-      });
-    }
-  } else {
-    submitResponse = await fetchWithTimeout(submitUrlGenerations, {
-      method: "POST",
-      headers: {
-        ...submitHeaders,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: model,
-        prompt: prompt || "A beautiful scenery",
-        ...(images.length > 0 ? { image: images[0] } : {}),
-        response_format: "url",
-        size: size,
-        n: 1,
-      }),
-    });
-  }
+  // ModelScope 的 Qwen Image Edit 系列通常走 /images/generations，并使用 image_url 传入参考图
+  // 参考：ModelScope 社区示例（/v1/images/generations + image_url）
+  // https://modelscope.csdn.net/691c36ee82fbe0098caca391.html
+  const submitResponse = await fetchWithTimeout(submitUrlGenerations, {
+    method: "POST",
+    headers: {
+      ...submitHeaders,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: model,
+      prompt: prompt || "A beautiful scenery",
+      ...(imageUrlList.length > 0 ? { image_url: imageUrlList } : {}),
+      ...(rawImage ? { image: rawImage } : {}),
+      response_format: "url",
+      size: size,
+      n: 1,
+    }),
+  });
 
   if (!submitResponse.ok) {
     const errorText = await submitResponse.text();
@@ -529,7 +470,8 @@ async function handleModelScope(
   const maxAttempts = 60;
   let pollingAttempts = 0;
   
-  const defaultTaskType = isImageEditModel ? "image_edit" : "image_generation";
+  // ModelScope 文档/示例里图像任务通常使用 image_generation（包括 image edit 模型）
+  const defaultTaskType = "image_generation";
 
   for (let i = 0; i < maxAttempts; i++) {
     await new Promise(resolve => setTimeout(resolve, 5000));
